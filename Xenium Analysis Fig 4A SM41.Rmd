@@ -1,0 +1,245 @@
+---
+title: "Xenium L3 Analysis V3"
+author: "Willa Kerkhoff"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data summary
+
+This code that allows easy recreation of Figure 4A, where we show an ImageDimPlot of 
+the SM41 xenium section with layers demarcated by cluster (UMAP) and our barcode transcripts.
+
+**Monkey**: Eugene, SM41
+
+**Injection, virus**: RMacL3-01, injected into dorsal bank of the principle sulcus
+
+**Viral components**: HSP, GFP, dna barcode A5
+
+**Date of Xenium run**: Feb. 21, 2025
+
+**Section ID**: 294 LHem
+
+**Xenium slide ID**: 0049095
+
+**Xenium file name**:
+
+* output-XETG00473__0049095__EUGENE__20250221__211144
+
+## Setup
+
+```{r, message=FALSE, warnings=FALSE}
+
+library(Seurat)
+library(future)
+library(ggplot2)
+library(arrow)
+library(dplyr)
+library(gridExtra)
+library(ggplot2)
+
+plan("multisession", workers = 10)
+
+```
+
+## Analysis
+
+To keep this analysis from taking forever to run, I've cut out the first PCA/UMAP 
+I ran on Eugene and just saved that result as an .rds file. The filename is 
+`Eugene_initialPCA.rds`, and I've saved it in his xenium output file.
+
+The broad steps performed were:
+- import of xenium object from file
+- removal of all genes that had zero transcripts in the original, raw dataset
+- `SCTransform()`, `RunPCA()`, `RunUMAP()`, `FindNeighbors()`, and `FindClusters()`
+- all of the above functions were run with all AAV+ positive features held out of analysis
+- save as rds
+
+Now I'll read the rds back in and start working on improving the clustering and filtering
+down the dataset. I want to end up with a dataset that contains primarily excitatory neurons.
+
+```{r, message=FALSE, warnings=FALSE}
+
+xenium.obj <- readRDS("Eugene_initialPCA.rds")
+
+```
+
+
+Now we do the white matter filtering.
+
+```{r}
+
+DimPlot(xenium.obj)
+ImageDimPlot(xenium.obj, flip_xy = FALSE)
+
+# repeated subsetting to remove cells with transcripts for white matter-exclusive 
+# features, this should get us to a primarily cortical data set
+
+xenium.obj <- subset(xenium.obj, subset = MBP == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = GFAP == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = MOXD1 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = GBX1 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = NKD1 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = ONECUT1 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = SYT6 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = ERBB3 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = ERMN == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = KLK6 == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = MAG == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = MAL == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = MOBP < 1.1, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = MOG == 0, slot = 'counts' )
+xenium.obj <- subset(xenium.obj, subset = MYRF == 0, slot = 'counts' )
+
+# this plot should show very few cells left in white matter
+DimPlot(xenium.obj)
+ImageDimPlot(xenium.obj, nmols = 2000, flip_xy = FALSE)
+
+```
+
+
+Now let's visualize some of the key markers, mostly the A5 barcode, excitatory neuronal 
+markers, and markers for peripheral excitatory neurons (which were our target for this 
+particular enhancer AAV). My goal here is to decide which clusters in `xenium.obj` 
+should be kept for further analysis.
+
+```{r}
+
+DimPlot(xenium.obj)
+
+FeaturePlot(xenium.obj, features = c("dna-barcode-A5-low"), order = TRUE)
+FeaturePlot(xenium.obj, features = c("RBFOX3"), order = TRUE)
+FeaturePlot(xenium.obj, features = c("RORB"), order = TRUE)
+FeaturePlot(xenium.obj, features = c("CUX2"), order = TRUE)
+FeaturePlot(xenium.obj, features = c("SLC17A7"), order = TRUE)
+
+ImageDimPlot(xenium.obj, fov = "fov", molecules = c("SLC17A7"), nmols = 2000, flip_xy = FALSE)
+ImageDimPlot(xenium.obj, fov = "fov", molecules = c("RORB"), nmols = 2000, flip_xy = FALSE)
+ImageDimPlot(xenium.obj, fov = "fov", molecules = c("CUX2"), nmols = 2000, flip_xy = FALSE)
+ImageDimPlot(xenium.obj, flip_xy = FALSE)
+
+```
+
+
+Based on the above markers, I've chosen to keep clusters 0, 1, and 2 for further analysis.
+
+#Clustering
+
+Before clustering again I'm subsetting based on cluster label (keeping only 0,1,2) and
+also removing all GAD1+ cells (inhibitory neurons). 
+
+```{r, message=FALSE, warnings=FALSE}
+
+ex.neuron.obj <- subset(xenium.obj, subset=seurat_clusters %in% c(0,1,2))
+ex.neuron.obj <- subset(ex.neuron.obj, subset = GAD1 == 0, slot = 'counts' )
+FeaturePlot(ex.neuron.obj, features = c("GAD1"))
+FeaturePlot(ex.neuron.obj, features = c("RBFOX3"), order = TRUE)
+DimPlot(ex.neuron.obj)
+
+```
+
+
+Now we'll perform new clustering on `ex.neuron.obj` to see what clusters we can
+resolve from this reduced dataset. 
+
+```{r, message=FALSE, warnings=FALSE}
+
+options(future.globals.maxSize = 100000 * 1024^2)
+
+# Get list of all variable genes
+# Remove variable genes that start with dna (barcodes) or transgene (GFP)
+var_genes <- VariableFeatures(ex.neuron.obj)
+var_genes <- var_genes[!startsWith(var_genes, "dna")]
+var_genes <- var_genes[!startsWith(var_genes, "transgene")]
+var_genes <- var_genes[!startsWith(var_genes, "rabies")]
+
+# Now we set our vector of gene names back to VariableFeatures()
+VariableFeatures(ex.neuron.obj) <- var_genes
+
+# run sctransform with AAV+ features regressed out
+ex.neuron.obj <- SCTransform(ex.neuron.obj, assay = "Xenium", vars.to.regress = c("barcodes","GFP","rabies"), verbose = FALSE)
+
+ex.neuron.obj <- RunPCA(ex.neuron.obj, npcs = 30, features = VariableFeatures(ex.neuron.obj))
+ex.neuron.obj <- RunUMAP(ex.neuron.obj, dims = 1:12)
+ex.neuron.obj <- FindNeighbors(ex.neuron.obj, reduction = "pca", dims = 1:12)
+ex.neuron.obj <- FindClusters(ex.neuron.obj, resolution = 0.3)
+
+```
+
+Now we look at the new excitatory neuron clusters. 
+
+```{r, message=FALSE, warnings=FALSE}
+
+ex.neuron.clusters <- DimPlot(ex.neuron.obj,label = TRUE, repel = TRUE)
+print(ex.neuron.clusters)
+
+ImageDimPlot(ex.neuron.obj, fov = "fov", flip_xy = FALSE)
+ImageDimPlot(ex.neuron.obj, fov = "fov", molecules = c("dna_barcode_A5_low"), nmols = 1000, flip_xy = FALSE)
+
+
+FeaturePlot(ex.neuron.obj, features = c("RORB","CUX2","MEIS2"),order = TRUE)
+FeaturePlot(ex.neuron.obj, features = c("dna-barcode-A5-low"),order = TRUE)
+FeaturePlot(ex.neuron.obj, features = c("ITGA8"),order = TRUE)
+FeaturePlot(ex.neuron.obj, features = c("PCP4"),order = TRUE)
+FeaturePlot(ex.neuron.obj, features = c("ALPL"),order = TRUE)
+FeaturePlot(ex.neuron.obj, features = c("NR4A2"),order = TRUE)
+
+
+```
+
+
+We've still got more clusters than excitatory cell types identified via RNASeq (11 clusters).
+The best course I've found from here is to now filter by specifically identifying excitatory
+neurons (rather than just taking inhibitory ones out). In the next section I do that
+and then cluster again.
+
+```{r}
+
+ex.neuron.obj2 <- subset(ex.neuron.obj, subset = SLC17A7 != 0, slot = 'counts')
+
+ex.neuron.obj2 <- RunPCA(ex.neuron.obj2, npcs = 30, features = VariableFeatures(ex.neuron.obj2))
+ex.neuron.obj2 <- RunUMAP(ex.neuron.obj2, dims = 1:12)
+ex.neuron.obj2 <- FindNeighbors(ex.neuron.obj2, reduction = "pca", dims = 1:12)
+ex.neuron.obj2 <- FindClusters(ex.neuron.obj2, resolution = 0.3)
+
+
+```
+
+
+This entire final section is just devoted to visualizing the clusters from `ex.neuron.obj2`
+the way that I did for Figure4A of the Neuron resubmission.
+
+```{r}
+
+ImageDimPlot(ex.neuron.obj2, flip_xy = FALSE)
+ImageDimPlot(ex.neuron.obj2, fov = "fov", molecules = c("dna_barcode_A5_low"), nmols = 1000, flip_xy = FALSE)
+
+DimPlot(ex.neuron.obj2)
+
+FeaturePlot(ex.neuron.obj2, features = c("RBFOX3"),order = TRUE)
+FeaturePlot(ex.neuron.obj2, features = c("RORB","CUX2","MEIS2","dna-barcode-A5-low"),order = TRUE)
+FeaturePlot(ex.neuron.obj2, features = c("ALPL","TYR"),order = TRUE)
+FeaturePlot(ex.neuron.obj2, features = c("POU3F1","PCP4","TBX15"),order = TRUE)
+FeaturePlot(ex.neuron.obj2, features = c("NR4A2"),order = TRUE)
+FeaturePlot(ex.neuron.obj2, features = c("ITGA8","NKD1","SYT"),order = TRUE)
+
+ex2.cluster.labels <- ex.neuron.obj2$seurat_clusters
+
+my_cols <- c('0'='#6cc7cf','1'='#c2da4e','2'='#e702f7','3'='#000000','4'='#000000',
+  '5'='#000000','6'='#000000','7'='#000000','8'='#000000')
+
+my_cols2 <- my_cols[order(as.integer(names(my_cols)))]
+scales::show_col(my_cols2)
+
+ImageDimPlot(ex.neuron.obj2, fov = "fov", cols = my_cols2, molecules = c("dna_barcode_A5_low"), nmols = 1000, flip_xy = FALSE, mols.cols = "white", mols.size = 0.0001)
+
+
+
+
+```
+
+

@@ -1,0 +1,223 @@
+---
+title: "Xenium Analysis Fig 4C_D SM38"
+author: "Willa Kerkhoff"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+
+library(Seurat)
+library(future)
+library(ggplot2)
+library(arrow)
+library(dplyr)
+library(gridExtra)
+library(ggplot2)
+
+```
+
+## Summary
+
+This code allows easy recreation of Figure 4D and E in SM38 (green), where we demonstrate 
+the specificity and efficiency of RMacL3-01 for peripheral cortical layers in rhesus macaque. 
+
+**Monkey**: SM38
+
+**Injection, virus**: RMacL3-01, injected into dorsal bank of the principle sulcus
+
+**Viral components**: HSP, GFP, 1st ranked L3 enhancer, dna barcode A5
+
+**Date of Xenium run**: Feb. 21, 2025
+
+**Section ID**: 450 LHem
+
+**Xenium slide ID**: 0049095
+
+**Xenium file name**: output-XETG00473__0049095__GOLIATH__20250221__211144
+
+
+## Analysis
+
+We start by constructing a xenium object for SM38 using seurat.
+
+```{r, message=FALSE, warnings=FALSE}
+
+plan("multisession", workers = 10)
+path <- "~/Desktop/20250221__211124__SM41_45_SM36_294_SM56_186/output-XETG00473__0049095__GOLIATH__20250221__211144"
+
+xenium.obj <- LoadXenium(path)
+
+```
+
+Outside of this code, ROIs across layers were outlined in SM38 using the lasso tool
+in the Xenium Explorer Platform. The Explorer allows users to save the coordinates 
+of their lassoed region as .csv files, which they can then use to subset their xenium
+data for analysis. We have established ROIs for L1, L23, L4, and L56 in SM38 and saved
+those in the xenium output file. The following code will create separate xenium objects
+for each layer ROI.
+
+```{r, message=FALSE, warnings=FALSE}
+
+L1 <- read.csv("~/Desktop/20250221__211124__SM41_45_SM36_294_SM56_186/output-XETG00473__0049095__GOLIATH__20250221__211144/Glayer1_cells_stats.csv")
+L23 <- read.csv("~/Desktop/20250221__211124__SM41_45_SM36_294_SM56_186/output-XETG00473__0049095__GOLIATH__20250221__211144/Glayer23_cells_stats.csv")
+L4 <- read.csv("~/Desktop/20250221__211124__SM41_45_SM36_294_SM56_186/output-XETG00473__0049095__GOLIATH__20250221__211144/Glayer4_cells_stats.csv")
+L56 <- read.csv("~/Desktop/20250221__211124__SM41_45_SM36_294_SM56_186/output-XETG00473__0049095__GOLIATH__20250221__211144/Glayer56_cells_stats.csv")
+
+layer1 <- subset(xenium.obj, cells = unlist(L1))
+layer23 <- subset(xenium.obj, cells = unlist(L23))
+layer4 <- subset(xenium.obj, cells = unlist(L4))
+layer56 <- subset(xenium.obj, cells = unlist(L56))
+
+```
+
+Now we use `FetchData()` to extract only the data we need for further analysis.
+For each layer ROI, we want a table containing all cells that lists the transcript 
+counts for the following features: `dna-barcode-A5-low`, `CUX2`, `RORB`, and 
+`SLC17A7`. 
+
+```{r}
+
+L1 <- FetchData(object = layer1, vars = c("dna-barcode-A5-low","CUX2","RORB","SLC17A7"), layer = "counts")
+L23 <- FetchData(object = layer23, vars = c("dna-barcode-A5-low","CUX2","RORB","SLC17A7"), layer = "counts")
+L4 <- FetchData(object = layer4, vars = c("dna-barcode-A5-low","CUX2","RORB","SLC17A7"), layer = "counts")
+L56 <- FetchData(object = layer56, vars = c("dna-barcode-A5-low","CUX2","RORB","SLC17A7"), layer = "counts")
+
+```
+
+From these tables, we will reproduce the findings reported in Figure 4D and 4E. We 
+will begin by calculating specificity, shown in Figure 4D. 
+
+**Specificity = # of A5+ cells in layer / all positive cells across all layers**
+
+```{r}
+
+# SM38 threshold for RMacL3_01+ classification
+threshold <- 2
+
+L1positive <- sum(L1$`dna-barcode-A5-low`>threshold) #count TRUE in logical vector
+L23positive <- sum(L23$`dna-barcode-A5-low`>threshold)
+L4positive <- sum(L4$`dna-barcode-A5-low`>threshold)
+L56positive <- sum(L56$`dna-barcode-A5-low`>threshold)
+
+A5positive <- L1positive + L23positive + L4positive + L56positive
+
+L1specificity <- L1positive/A5positive
+L23specificity <- L23positive/A5positive
+L4specificity <- L4positive/A5positive
+L56specificity <- L56positive/A5positive
+
+
+Specificity <- data.frame(
+    Layer = c(1,2,4,5), 
+    Specificity = c(L1specificity,L23specificity,L4specificity,L56specificity),
+    stringsAsFactors = FALSE
+)
+# Specificity <- data.frame(L1specificity,L23specificity,L4specificity,L56specificity)
+Specificity
+
+```
+
+
+To give us significance margins for specificity across layers, we're going to run
+a permutation test to determine what level of specificity we would expect across
+layers if RMacL3_01 infection was entirely random ($H_0$). 
+
+
+```{r}
+
+L1$layer <- rep(1, count(L1)$n)
+L23$layer <- rep(2, count(L23)$n)
+L4$layer <- rep(4, count(L4)$n)
+L56$layer <- rep(5, count(L56)$n)
+
+allLayers <- rbind(L1,L23,L4,L56)
+
+set.seed(41)
+
+n_perm <- 1000
+
+perm_specificity <- rep(0,1)
+
+for (i in 1:n_perm) {
+  allLayers.perm <- transform(allLayers, layer = sample(layer))
+  specificity.i <- allLayers.perm %>% group_by(layer) %>% 
+  summarise(perm_specificity=sum(`dna-barcode-A5-low`>threshold)/A5positive,
+            .groups = 'drop')
+  perm_specificity <- rbind(perm_specificity,specificity.i)
+}
+
+perm_specificity <- subset(perm_specificity, layer > 0)
+
+# what are the null means
+permSpec.means <- perm_specificity %>% group_by(layer) %>% 
+  summarise(mean= mean(perm_specificity),
+            .groups = 'drop')
+
+# define quantiles of interest
+q = c(.5, .95)
+
+# calculate quantiles by grouping variable
+permSpec.quants <- perm_specificity %>%
+                        group_by(layer) %>%
+                        summarize(quant50 = quantile(perm_specificity, probs = q[1]), 
+                                  quant95 = quantile(perm_specificity, probs = q[2]))
+permSpec.quants
+
+```
+
+
+Grey-filled bars in 4D are the means calculated above, with error bars showing the
+50% (quant50) and 95% (quant95) bounds for the null distribution. Importantly, the 
+bounds generated by this code will vary *slightly* from what is reported in Figure 4D, 
+as this analysis relies on a shuffle based test that will always include some variation. 
+
+At this point, we are going to switch gears and focus on efficiency rather than 
+specificity. The following analysis is relevant for Figure 4E SM38 (green).
+
+**Efficiency = # of A5+ cells in layer / all cells in layer**
+
+```{r}
+
+L1efficiency <- L1positive/count(L1)$n
+L23efficiency <- L23positive/count(L23)$n
+L4efficiency <- L4positive/count(L4)$n
+L56efficiency <- L56positive/count(L56)$n
+
+Efficiency <- data.frame(L1efficiency,L23efficiency,L4efficiency,L56efficiency)
+
+```
+
+
+Now for significance. We'll be calculating the standard error of a proportion for 
+our error bars and running proportion tests to assess pair-wise significance between
+efficiency in L23 and each other layer.
+
+
+```{r}
+
+# se = sqrt(p*(1-p)/n)
+
+L1er <- sqrt(L1efficiency*(1-L1efficiency)/count(L1)$n)
+L23er <- sqrt(L23efficiency*(1-L23efficiency)/count(L23)$n)
+L4er <- sqrt(L4efficiency*(1-L4efficiency)/count(L4)$n)
+L56er <- sqrt(L56efficiency*(1-L56efficiency)/count(L56)$n)
+
+Eff.er <- data.frame(L1er,L23er,L4er,L56er)
+
+# proportion test between L23 and each of the other layers (L1, L4, L56)
+
+L23.L1test <- prop.test(x = c(L1positive, L23positive), n = c(count(L1)$n, count(L23)$n))
+L23.L1test
+
+L23.L4test <- prop.test(x = c(L4positive, L23positive), n = c(count(L4)$n, count(L23)$n))
+L23.L4test
+
+L23.L56test <- prop.test(x = c(L56positive, L23positive), n = c(count(L56)$n, count(L23)$n))
+L23.L56test
+
+```
+
+
+
+
